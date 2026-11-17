@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 模型与运行时数据（体积大、可重新下载）
+models/
+data/
+*.log
+.pip-*.log
+
+# 打包产物
+dist/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store

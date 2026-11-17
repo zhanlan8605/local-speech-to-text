@@ -1,0 +1,8 @@
+# 样例音频真值
+#
+# 格式：<文件名>|<语种>|<文本>
+# 语种用于断言模型的语言识别结果；文本用于计算字符相似度。
+# 修改音频后必须同步更新本文件。
+
+chinese.wav|zh|今天天气不错，我们下午三点在会议室开会。请大家准时参加。
+english.wav|en|The quick brown fox jumps over the lazy dog. This audio is used to test a local speech recognition system.
