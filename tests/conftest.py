@@ -68,3 +68,25 @@ def sample_webm(sample_wav: Path, tmp_path: Path) -> Path:
     if proc.returncode != 0 or not target.exists():
         pytest.skip(f"当前 ffmpeg 不支持 libopus：{(proc.stderr or '').strip()[:200]}")
     return target
+
+
+@pytest.fixture(scope="session")
+def real_engine():
+    """加载真实 SenseVoiceSmall + fsmn-vad，供 `-m slow` 用例共享一次加载开销。"""
+    from app.asr.sensevoice import SenseVoiceEngine
+    from app.config import settings
+
+    engine = SenseVoiceEngine(
+        model_id=settings.asr_model,
+        vad_model_id=settings.vad_model or None,
+        device=settings.device,
+        threads=settings.threads,
+        punc_model_id=settings.punc_model or None,
+    )
+    engine.warmup()
+    if not engine.loaded:
+        pytest.skip(f"模型未能加载：{engine.load_error}")
+    try:
+        yield engine
+    finally:
+        engine.unload()

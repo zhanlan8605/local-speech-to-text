@@ -98,6 +98,11 @@ class Settings:
 
     max_upload_mb: int = field(default_factory=lambda: _env_int("A2T_MAX_UPLOAD_MB", 10))
 
+    # 实时识别（WebSocket）：单次最长时长，设为 0 可关闭该功能
+    stream_max_seconds: int = field(
+        default_factory=lambda: _env_int("A2T_STREAM_MAX_SECONDS", 60)
+    )
+
     # 模型 id（ModelScope 命名空间）
     asr_model: str = field(default_factory=lambda: os.getenv("A2T_ASR_MODEL", "iic/SenseVoiceSmall"))
     vad_model: str = field(
@@ -132,6 +137,10 @@ class Settings:
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def streaming_enabled(self) -> bool:
+        return self.stream_max_seconds > 0
 
 
 settings = Settings()

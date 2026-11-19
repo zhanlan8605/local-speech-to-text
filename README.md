@@ -4,11 +4,12 @@
 
 - 支持中文、英文，兼容中英混说；自动语种识别
 - 支持网页实时录音（单次最长 60 秒）与文件上传两种输入
+- 录音过程中**边说边出字**：WebSocket 分片传输，停止前即可看到不断更新的识别文本
 - 上传的文件和录音都可在页面内回放，确认音频内容后再识别
 - 全离线运行，首次下载模型后可断网使用
 - 纯 CPU 可用，有 GPU 时切换一个环境变量即可加速
 - 无前端构建步骤，原生 HTML / CSS / JavaScript
-- 三个 HTTP 接口，适合二次集成
+- 三个 HTTP 接口 + 一个 WebSocket 接口，适合二次集成
 
 ## 快速开始
 
@@ -93,16 +94,50 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 1. 点击 **开始录音 Start Recording**，浏览器会弹出麦克风授权请求，选择「允许」；
 2. 录音中会显示红点和「录音中，请说话…」，右侧实时显示 `已录时长 / 01:00`；
-3. 点击 **停止录音 Stop Recording**，音频自动提交识别；
-4. 识别完成后状态变为「识别完成，可以再次录音」，可直接开始下一段；音频可以在文件信息区的播放按钮上回放。
+3. 说话过程中「实时识别」区域会持续出现文字：已确定的句子正常显示，正在说的尾部用浅灰色；底部「识别结果」框此时保持为空；
+4. 点击 **停止录音 Stop Recording**，服务端补上最后一句并返回最终文本，状态变为「识别完成，可以再次录音」；
+5. 录音同时生成可回放的 WebM，停止后可在文件信息区播放。
 
 约束与说明：
 
-- 单次录音最长 **60 秒**，到时自动停止并提交；
-- 录音结束前不会发起识别，避免半截音频进入模型；
+- 单次录音最长 **60 秒**，到时自动停止并返回最终结果；
+- 实时识别走 WebSocket，音频以 16kHz/16bit/单声道 PCM 分片发送，不经过容器封装；
+- 如果浏览器不支持 AudioWorklet 或 WebSocket 连接失败，录音仍会继续，停止后自动改用 `/api/transcribe` 上传识别；
 - 麦克风被拒绝、没有设备、被其他程序占用时会显示具体原因；
-- 录音格式为浏览器原生的 WebM/Opus（Chrome / Edge），服务端统一转 16kHz 后识别；
 - 麦克风权限要求页面处于安全上下文：`http://127.0.0.1` / `http://localhost` 或 HTTPS。
+
+### 实时识别（流式）实现
+
+SenseVoiceSmall 不是流式模型，这里用「滚动重解码」实现近实时，不要求模型改造：
+
+1. 前端用 AudioWorklet 采集麦克风，重采样为 16kHz、16bit、单声道 PCM，每约 128ms 发一帧（约 4KB）；
+2. 服务端按会话累积「尚未提交」的音频，每新增约 1 秒音频重新解码一次；
+3. 解码复用带 fsmn-vad 的识别流程：若缓冲区尾部已有 ≥0.45 秒静音，判定这句话说完，把结果写入 `committed` 并丢弃对应音频；否则整段结果作为 `partial` 返回；
+4. 未提交缓冲超过 6 秒时强制提交，保证单次解码时长与内存有上限，长时间连续讲话也不会越来越慢；
+5. 停止时对整段录音重新解码一次（最多 60 秒，约 2MB），修正增量提交可能切开的句子，最终文本与上传识别一致。
+
+因此延迟通常在 **1–2 秒**量级（与机器性能、句间停顿有关），而不是等整段录音结束。
+
+消息协议（`/ws/stream`）：
+
+| 方向 | 内容 | 说明 |
+|---|---|---|
+| 客户端 → 服务端 | `{"type":"start","language":"auto"}` | 可选，指定语种；默认 `auto` |
+| 客户端 → 服务端 | 二进制帧 | 16kHz/16bit/单声道 PCM，字节序小端 |
+| 客户端 → 服务端 | `{"type":"stop"}` | 结束并请求最终结果 |
+| 服务端 → 客户端 | `{"type":"ready",...}` | 连接就绪，返回 `sample_rate`、`max_seconds` |
+| 服务端 → 客户端 | `{"type":"partial","text","committed","partial",...}` | 增量结果 |
+| 服务端 → 客户端 | `{"type":"final","text","duration_s","elapsed_s","segments"}` | 最终结果 |
+| 服务端 → 客户端 | `{"type":"error","detail"}` | 出错原因 |
+
+命令行验证真实模型的流式效果（需先启动服务）：
+
+```powershell
+python scripts\check_stream.py                      # 中文样例，按 1 倍速发送
+python scripts\check_stream.py samples\english.wav  # 英文样例
+```
+
+脚本会逐条打印中间结果及其出现时间，最后打印最终文本，便于观察端到端延迟。
 
 ### 音频回放
 
@@ -139,9 +174,10 @@ curl.exe "http://127.0.0.1:8000/health"
 |---|---|---|
 | `GET` | `/health` | 服务健康检查，模型加载期间返回 `warming` |
 | `POST` | `/api/transcribe` | 上传音频并识别（`file`、`language`、`response_format`） |
+| `WS` | `/ws/stream` | 实时识别：发送 PCM 分片，持续返回增量文本 |
 | `GET` | `/` | Web 页面 |
 
-`POST /api/transcribe` 的 `response_format` 支持 `json`（默认）、`txt`、`srt`。网页录音同样走该接口：前端把录音编码为 WebM/Opus 后作为 `file` 上传。
+`POST /api/transcribe` 的 `response_format` 支持 `json`（默认）、`txt`、`srt`。上传的文件走该接口；网页录音优先走 `/ws/stream`，实时通道不可用时自动回退到该接口。
 
 ## 测试
 
@@ -149,18 +185,18 @@ curl.exe "http://127.0.0.1:8000/health"
 
 | 类型 | 命令 | 说明 |
 |---|---|---|
-| 常规自动化 | `python -m pytest -q` | 使用 `FakeASREngine` 模拟模型输出，不加载真实模型、不下载模型、不需要麦克风 |
-| 真实模型 | `python -m pytest -m slow -v -s` | 加载本地 SenseVoiceSmall + fsmn-vad，验证中英文样例的真实识别效果 |
+| 常规自动化 | `python -m pytest -q` | 使用 `FakeASREngine` / 脚本化引擎模拟模型输出，不加载真实模型、不下载模型、不需要麦克风 |
+| 真实模型 | `python -m pytest -m slow -v -s` | 加载本地 SenseVoiceSmall + fsmn-vad，验证中英文样例的真实识别效果与实时分片链路 |
 
 `pytest.ini` 已配置 `addopts = -m "not slow"`，因此 `python -m pytest -q` 会自动跳过真实模型用例；只有显式加 `-m slow` 才会加载模型。
 
-默认套件覆盖接口契约、错误码、文本后处理、音频转码、VAD 分段、模型路径解析、前端录音/回放静态契约等，几秒内完成。前端录音用预生成的 WebM 音频夹具验证上传链路，**不依赖实际麦克风硬件**。
+默认套件共 **82 项**，覆盖接口契约、错误码、文本后处理、音频转码、VAD 分段、模型路径解析、WebSocket 流式会话（句尾提交、强制提交、时长截断、停止整段重解码）、前端录音/回放/实时识别静态契约等，几秒内完成。前端录音用预生成的 WebM 音频夹具验证上传链路，**不依赖实际麦克风硬件**。
 
-真实模型测试位于 `tests/test_model_slow.py`：
+真实模型测试（3 项）：
 
-- 读取 `samples/chinese.wav`、`samples/english.wav` 和 `samples/reference.txt`；
-- 同时验证中文、英文的语种判断与字符相似度（阈值 0.6）；
-- 模型未缓存时，首次运行会自动下载约 900MB，因此单独执行、不放入默认套件。
+- `tests/test_model_slow.py`：读取 `samples/chinese.wav`、`samples/english.wav` 和 `samples/reference.txt`，验证中文、英文的语种判断与字符相似度（阈值 0.6）；
+- `tests/test_model_stream_slow.py`：用真实的「分片喂入 + 滚动重解码」链路跑中英文样例，断言停止前已出现部分文本、停止后得到最终文本；
+- 三个用例通过会话级 fixture 共享一次模型加载；模型未缓存时首次运行会自动下载约 900MB，因此单独执行、不放入默认套件。
 
 需要覆盖率时：
 
@@ -177,6 +213,7 @@ python -m pytest --cov=app
 | `A2T_DEVICE` | `cpu` | 设为 `cuda` 使用 GPU |
 | `A2T_THREADS` | `min(8, CPU 核数)` | 推理线程数 |
 | `A2T_MAX_UPLOAD_MB` | `10` | 上传大小上限 |
+| `A2T_STREAM_MAX_SECONDS` | `60` | 实时识别单次最长秒数；设为 `0` 关闭实时识别 |
 | `A2T_ASR_MODEL` | `iic/SenseVoiceSmall` | ASR 模型 id |
 | `A2T_VAD_MODEL` | `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch` | VAD 模型 id（`fsmn-vad` 别名同样可用） |
 | `A2T_PUNC_MODEL` | 空 | 设为 `ct-punc` 启用独立标点模型 |
@@ -187,12 +224,12 @@ python -m pytest --cov=app
 
 ```
 local-speech-to-text/
-├── app/            后端与模型集成
-├── static/         Web 前端（原生 HTML/CSS/JS）
+├── app/            后端与模型集成（api.py / streaming.py / asr/）
+├── static/         Web 前端（原生 HTML/CSS/JS，含 pcm-worklet.js）
 ├── tests/          pytest 测试
 ├── samples/        样例音频与真值
 ├── docs/           需求、设计、测试报告、开发记录
-├── scripts/        模型下载、样例生成
+├── scripts/        模型下载、样例生成、打包、流式检查
 ├── requirements.txt
 └── README.md
 ```

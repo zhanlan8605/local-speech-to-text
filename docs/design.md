@@ -130,19 +130,21 @@ rich 标签清理 → 语种提取 → 文本拼接（中英边界补空格）
 
 ### 4.1 浏览器录音（前端）
 
-录音完全在前端完成，后端不感知来源：
+录音同时走两条链路：一条用于**实时出字**（PCM 分片 → WebSocket），一条用于**回放与兜底**（MediaRecorder → WebM）：
 
 ```
 点击 Start Recording
    → navigator.mediaDevices.getUserMedia({audio})
    → 权限拒绝/无设备/被占用 → 显示具体原因，回到 idle
-   → new MediaRecorder(stream, WebM/Opus 优先)
+   → new MediaRecorder(stream, WebM/Opus 优先)   // 仅用于回放/兜底
+   → WebSocket /ws/stream + AudioWorklet 采集 PCM // 实时识别
    → 状态 recording，启动 100ms 计时器 + 60s 自动停止定时器
 点击 Stop Recording（或到达 60s）
-   → recorder.stop() → 收集 dataavailable → Blob
-   → 停止麦克风轨道
-   → new File([blob], "recording-<时间戳>.webm")
-   → 复用 /api/transcribe 上传识别
+   → 断开音频图 → 发送 {"type":"stop"} → 等待 final
+   → recorder.stop() → 收集 dataavailable → Blob（回放用）
+   → 实时通道可用：直接展示 final 文本，不再上传
+   → 实时通道失败：new File([blob], "recording-<时间戳>.webm")
+                    → /api/transcribe 上传识别
    → 状态 done，Start Recording 重新可用
 ```
 
@@ -153,7 +155,8 @@ rich 标签清理 → 语种提取 → 文本拼接（中英边界补空格）
 | 状态机 | `idle → requesting → recording → stopping → idle` | 按钮和上传区按状态禁用，避免并发录音/重复提交 |
 | 60 秒上限 | `setTimeout` 到点调用 `stopRecording()`，`dataavailable` 回调再做一次兜底 | 后台标签页定时器会被节流，双保险确保不会无限录制 |
 | 格式 | 依次探测 `audio/webm;codecs=opus`、`audio/webm`、`audio/ogg;codecs=opus`、`audio/mp4` | Chrome/Edge 原生 WebM，其他浏览器可退化；服务端已白名单 `.webm/.ogg/.m4a` |
-| 提交时机 | 只在 `recorder.stop` 事件后构造 Blob 并识别 | 保证进入模型的是完整一段录音，不是半截流 |
+| 实时通道 | 录音开始时并行建立 `/ws/stream`，失败只降级不影响录音 | 实时识别是增强能力，不能成为录音的前置条件 |
+| 提交时机 | 实时失败时，只在 `recorder.stop` 事件后构造 Blob 并上传 | 回退路径仍保证进入模型的是完整一段录音 |
 | 计时 | 基于 `performance.now()` 的 100ms 更新 | 只影响显示，不受系统时间调整影响 |
 | 权限错误 | `NotAllowedError` / `NotFoundError` / `NotReadableError` 等分别映射文案 | 用户能知道是拒绝授权、没设备还是被占用 |
 | 麦克风释放 | `getTracks().forEach(track => track.stop())` | 停止后浏览器不再显示录音指示，保护隐私 |
@@ -192,6 +195,64 @@ rich 标签清理 → 语种提取 → 文本拼接（中英边界补空格）
 
 > 回放完全是浏览器本地行为，音频不会因为播放而再次上传；识别仍然只在点击「开始识别」或录音停止后发生。
 
+### 4.3 实时识别（流式）
+
+SenseVoiceSmall 不是流式模型，方案是**分片采集 + 滚动重解码 + VAD 增量提交**，在服务端把「近实时」模拟出来，不改造模型。
+
+```
+浏览器 AudioWorklet（16kHz / 16bit / 单声道）
+   → 每 2048 采样（约 128ms）一帧 → WebSocket 二进制帧（约 4KB）
+服务端 StreamingSession
+   → 追加到 pending 缓冲
+   → 新增音频 ≥1.0s 且 pending ≥0.8s → 触发一次解码
+   → sensevoice.transcribe(pending)（内部含 fsmn-vad 分段）
+       ├─ 段尾距缓冲末尾 ≥0.45s（已说完）→ 写入 committed，丢弃对应 PCM
+       └─ 否则整段作为 partial 返回
+   → pending ≥6s 强制提交（连续讲话无停顿）
+   → {"type":"partial", text, committed, partial, segments, ...}
+点击 Stop Recording → 整段音频重新解码一次 → {"type":"final"}
+```
+
+关键设计：
+
+| 点 | 做法 | 原因 |
+|---|---|---|
+| 传输 | 原始 PCM16LE，不加 WebM/WAV 容器 | 服务端可任意切片重解码，不需要为每片重新解容器 |
+| 采样率 | 前端 `AudioContext({sampleRate:16000})`，Worklet 内再降采样兜底 | 与 SenseVoice / fsmn-vad 训练采样率一致，省去服务端重采样 |
+| 采集 | AudioWorklet 优先，`ScriptProcessor` 降级 | Worklet 在音频线程执行，不受主线程卡顿影响 |
+| 解码节流 | 按**音频时长**而非墙钟触发（≥1s），且 pending ≥0.8s | 结果可复现，测试不依赖真实时间；同时限制 CPU 占用 |
+| 提交判定 | 段尾之后还有 ≥0.45s 缓冲 → 认为句子已结束 | 用 VAD 时间戳判断「说完了」，避免把半句话定稿 |
+| 缓冲上限 | pending 超过 6s 强制提交 | 单次解码时长与内存有上限，长讲话不会越来越慢 |
+| 最终文本 | 停止时保留完整 PCM（≤60s，约 2MB）并整段重解码 | 增量提交可能从句子中间切开；整段重解码保证最终结果与 `/api/transcribe` 一致 |
+| 静音丢弃 | 无语音且 pending ≥12s 时直接丢弃 | 长时间不说话也不会占内存 |
+| 时长上限 | `A2T_STREAM_MAX_SECONDS`（默认 60）截断并返回 `final` | 与录音上限一致，避免无限会话 |
+| 帧大小 | 单帧上限 512KB，超过返回 `error` | 防止异常客户端占用内存 |
+| 并发 | 每个会话独立缓冲，推理仍走引擎的单锁 | 与同步接口共享同一把锁，CPU 不会被并发推理拖慢 |
+| 失败回退 | 前端捕获连接/协议错误后继续录音，停止时走 `/api/transcribe` | 实时识别不可用时功能仍完整 |
+| 展示位置 | 增量文本只渲染在「实时识别」区域；底部「识别结果」框只在停止后写入最终文本 | 避免用户把未定稿的中间结果当成最终稿，复制/下载也只对最终文本启用 |
+
+前端状态机（与录音并存）：
+
+```
+idle → 建立 WebSocket → ready → start → started → 开始采集
+     → partial…（committed 正常色 / partial 浅灰）
+     → stop → final → 渲染最终文本 → idle
+任意阶段失败 → failed（提示"实时识别不可用"）→ 录音继续 → 停止后上传识别
+```
+
+服务端消息契约：
+
+| 方向 | 消息 | 说明 |
+|---|---|---|
+| C→S | `{"type":"start","language":"auto"}` | 可选；`auto/zh/en/ja/ko/yue` |
+| C→S | 二进制帧 | PCM16LE、16kHz、单声道 |
+| C→S | `{"type":"stop"}` | 结束并请求最终结果 |
+| S→C | `{"type":"ready","model","sample_rate","max_seconds"}` | 握手；模型未就绪或功能关闭时改发 `error` 并关闭 |
+| S→C | `{"type":"started","language","sample_rate","max_seconds"}` | `start` 被接受 |
+| S→C | `{"type":"partial","text","committed","partial","duration_s","elapsed_s","segments"}` | 增量结果；`text = committed + partial` |
+| S→C | `{"type":"final",...}` | 停止后的最终文本，`partial` 为空 |
+| S→C | `{"type":"error","detail"}` | 出错原因（中文） |
+
 ## 5. 接口设计
 
 ### GET /health
@@ -204,11 +265,13 @@ rich 标签清理 → 语种提取 → 文本拼接（中英边界补空格）
   "backend": "funasr",
   "threads": 8,
   "max_upload_mb": 10,
+  "streaming_enabled": true,
+  "stream_max_seconds": 60,
   "version": "0.1.0"
 }
 ```
 
-`status` 为 `warming` 时表示模型仍在加载。该接口不获取推理锁，因此模型加载期间也能立即响应。`max_upload_mb` 为当前生效的上传上限，前端用它同步提示与本地校验，避免前后端上限不一致。
+`status` 为 `warming` 时表示模型仍在加载。该接口不获取推理锁，因此模型加载期间也能立即响应。`max_upload_mb` 为当前生效的上传上限，前端用它同步提示与本地校验，避免前后端上限不一致。`streaming_enabled` / `stream_max_seconds` 告诉前端实时识别是否可用及其单次上限。
 
 ### POST /api/transcribe
 
@@ -237,6 +300,21 @@ rich 标签清理 → 语种提取 → 文本拼接（中英边界补空格）
 
 上传上限采用两层校验：HTTP 中间件在 multipart 解析前检查 `Content-Length`（预留 64KB 边界与字段开销），明显超限直接返回 413；进入接口后再由 `_save_upload()` 按 1MB 分块累计，兜底处理未声明长度或头部不准确的情况。默认上限 10MB，可用 `A2T_MAX_UPLOAD_MB` 调整，并通过 `/health` 的 `max_upload_mb` 同步给前端。
 
+### WS /ws/stream
+
+实时识别接口，协议见 4.3。握手时先发 `ready`，随后客户端可发 `start` 与二进制 PCM 帧。服务端在下列情况结束会话：
+
+| 情况 | 行为 |
+|---|---|
+| 收到 `{"type":"stop"}` | 对整段音频重新解码，返回 `final` |
+| 累计音频达到 `A2T_STREAM_MAX_SECONDS` | 截断后续音频，返回 `final` |
+| 模型未加载完成 | 返回 `error`（"模型尚未加载完成"）并以 1013 关闭 |
+| `A2T_STREAM_MAX_SECONDS=0` | 返回 `error`（"实时识别已关闭"）并以 1013 关闭 |
+| 单帧超过 512KB | 返回 `error`，不写入缓冲 |
+| 客户端断开 | 清理临时缓冲与临时 WAV，不影响其他会话 |
+
+> 实时会话复用同一个 `SenseVoiceEngine`，因此与 HTTP 识别共享单锁串行；模型加载期间连接会直接被拒绝，前端提示稍后再试。
+
 ### GET /
 
 返回 `static/index.html`，页面内通过 `/static/*` 加载样式与脚本。
@@ -245,6 +323,7 @@ rich 标签清理 → 语种提取 → 文本拼接（中英边界补空格）
 
 - **单进程**：不启用多 worker。每个 worker 都会加载一份模型，CPU 上只会互相拖慢。
 - **推理串行**：`SenseVoiceEngine` 内部使用一把 `RLock`，把「模型加载 + 推理」串行化。第二个并发请求会等待，而不是抢占 CPU。
+- **实时会话共享同一把锁**：`/ws/stream` 的每次增量解码也走 `transcribe()`，因此与上传识别互斥。多个实时连接同时说话时，解码请求会排队，文本仍按各自会话返回，不会串台。
 - **不阻塞事件循环**：转码与推理通过 `run_in_threadpool` 执行，`/health` 与静态资源在推理期间仍可响应。
 - **线程数**：默认 `min(8, os.cpu_count())`，可通过 `A2T_THREADS` 调整；`torch.set_num_threads()` 在加载时设置。
 - **预热与卸载**：启动时后台线程加载模型；应用关闭时 `unload()` 释放引用。
@@ -263,6 +342,7 @@ rich 标签清理 → 语种提取 → 文本拼接（中英边界补空格）
 | `A2T_DEVICE` | `cpu` | `cpu` / `cuda` |
 | `A2T_THREADS` | min(8, 核数) | 推理线程数 |
 | `A2T_MAX_UPLOAD_MB` | `10` | 上传大小上限 |
+| `A2T_STREAM_MAX_SECONDS` | `60` | 实时识别单次最长秒数；`0` 关闭实时识别 |
 | `A2T_ASR_MODEL` | `iic/SenseVoiceSmall` | ASR 模型 id |
 | `A2T_VAD_MODEL` | `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch` | VAD 模型 id，置空可关闭；`fsmn-vad` 别名也支持 |
 | `A2T_PUNC_MODEL` | 空 | 设为 `ct-punc` 启用独立标点模型 |
@@ -290,7 +370,7 @@ rich 标签清理 → 语种提取 → 文本拼接（中英边界补空格）
 4. **标点**：默认使用 SenseVoice 自带标点，中文场景足够；中英混排的英文标点可能不统一，可通过 `A2T_PUNC_MODEL=ct-punc` 改善。
 5. **模型许可**：SenseVoiceSmall 权重使用 FunASR 模型开源协议 v1.1，商用需保留模型名称与来源署名。
 6. **首次启动**：需要下载约 940MB 模型（SenseVoiceSmall 936MB + VAD 2MB），网络受限时请先运行 `scripts/download_models.py`。
-7. **录音不是流式识别**：必须停止录音后才上传，无法边说边出字；真正的实时流式需要 WebSocket 与流式模型。
+7. **实时识别不是模型原生流式**：靠分片重解码模拟，延迟取决于句间停顿与机器性能（常见 1–2 秒）；没有字级时间戳，partial 可能被后续解码改写。
 8. **录音格式依赖浏览器**：Chrome/Edge 产出 WebM/Opus；Safari/Firefox 的 `MediaRecorder` 行为未在本期验证。
 9. **录音状态仅存于页面内存**：刷新页面会丢失尚未提交的录音（`beforeunload` 会提示）。
 10. **回放依赖浏览器解码**：WMA、AMR 等格式浏览器可能无法播放，此时只影响预览，识别仍由服务端 ffmpeg 完成。

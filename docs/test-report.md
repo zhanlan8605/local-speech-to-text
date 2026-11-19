@@ -23,6 +23,7 @@
 | fastapi | 0.163.1 |
 | starlette | 1.10.0 |
 | uvicorn | 0.54.0 |
+| websockets | 17.4 |
 | numpy | 2.5.5 |
 | soundfile | 0.14.0 |
 | imageio-ffmpeg | 0.8.1 |
@@ -40,6 +41,8 @@
 | 端到端验证 | 启动 uvicorn，用 curl 上传样例 | 验证完整链路、响应格式、SRT 时间轴、真实耗时 |
 | 前端验证 | 浏览器手工操作 | 拖拽、上传、进度、复制、下载、错误提示 |
 | 录音验证 | 浏览器 + 合成音源 + 权限 mock | 权限拒绝、录音、计时、60 秒自动停止、停止后识别、连续录音 |
+| 实时识别测试 | `TestClient` WebSocket + 脚本化/能量 VAD 引擎 | 分片累积、句尾提交、强制提交、最终文本、错误与关闭分支 |
+| 实时链路冒烟 | `scripts/check_stream.py` 对运行中的服务发送真实样例 | 真实模型下部分文本出现时间、增量次数、端到端耗时 |
 | 离线验证 | `A2T_OFFLINE=1` + 无效代理启动 | 确认模型加载与识别不依赖网络 |
 
 默认 `python -m pytest -q` 通过 `pytest.ini` 中的 `-m "not slow"` 排除真实模型用例；接口测试注入 `FakeASREngine`，录音格式用预生成 WebM 夹具验证。因此常规测试**不加载、不下载模型，也不依赖实际麦克风硬件**，几秒内完成。真实模型测试需要显式加 `-m slow` 单独执行。
@@ -54,9 +57,9 @@
 python -m pytest -q
 ```
 
-实际结果：**57 passed, 1 deselected in 5.74s**
+实际结果：**82 passed, 3 deselected in 4.98s**
 
-> 为确认默认套件确实不依赖模型，另做一次隔离验证：把 `A2T_MODELS_DIR` 指向空目录，并设置 `A2T_OFFLINE=1`，再执行 `python -m pytest -q`。结果仍为 **57 passed, 1 deselected**（9.62s），空模型目录内未产生任何文件，说明默认测试没有触发模型下载或加载。
+> 为确认默认套件确实不依赖模型，另做一次隔离验证：把 `A2T_MODELS_DIR` 指向空目录，并设置 `A2T_OFFLINE=1`，再执行 `python -m pytest -q`。结果仍为全部通过，空模型目录内未产生任何文件，说明默认测试没有触发模型下载或加载。
 
 | 文件 | 用例数 | 覆盖内容 | 结果 |
 |---|---|---|---|
@@ -66,7 +69,8 @@ python -m pytest -q
 | `tests/test_transcribe_api.py` | 14 | JSON/txt/srt 三种输出、WebM 录音上传、语言参数透传、非法参数 400、非法扩展名 415、空文件 400、超限 413、Content-Length 预判 413、推理异常 500 | 全部通过 |
 | `tests/test_engine.py` | 6 | VAD 毫秒区间解析、VAD 失败回退、按区间切音频、文本与时间戳对应、过短片段丢弃、推理异常包装 | 全部通过 |
 | `tests/test_config.py` | 6 | ModelScope 缓存布局解析、多快照取最新、`fsmn-vad` 别名、手工目录、已有目录直用、找不到时回退模型 id | 全部通过 |
-| `tests/test_frontend.py` | 9 | 录音控件、麦克风请求、60 秒上限、停止后才提交、权限/设备错误文案、再次录音、播放控件、WebM 时长探测、10MB 上限同步 | 全部通过 |
+| `tests/test_streaming.py` | 16 | 部分文本、句尾提交、6 秒强制提交、停止整段重解码、时长截断、半字节容错、WS 握手/错误/帧上限/未加载/关闭开关 | 全部通过 |
+| `tests/test_frontend.py` | 18 | 录音控件、麦克风请求、60 秒上限、停止提交、权限/设备错误、再次录音、回放控件、WebM 时长探测、10MB 同步、实时区域、WS+PCM 契约、Worklet、回退提示、实时文本与结果框分离 | 全部通过 |
 | `tests/test_packaging.py` | 2 | `requirements.txt` 自带 CPU 版 torch/torchaudio、锁文件包含 CPU 索引 | 全部通过 |
 
 关键用例明细：
@@ -90,6 +94,17 @@ python -m pytest -q
 | `test_js_plays_uploaded_and_recorded_audio` | 播放调用 `audio.play()`，录音也创建 object URL，并传入计时时长 |
 | `test_js_fixes_missing_webm_duration` | 存在 WebM 时长探测与「无法预览但仍可识别」提示 |
 | `test_upload_limit_is_10mb_and_synced_from_health` | 默认 10MB，前端从 `/health` 读取 `max_upload_mb` 并用于本地拦截 |
+| `test_decode_returns_partial_while_sentence_is_open` | 句子未结束时只返回 `partial`，`committed` 为空 |
+| `test_decode_commits_finished_sentence_and_trims_buffer` | 句尾静音 ≥0.45s 时提交，并裁掉已提交音频 |
+| `test_pending_is_force_committed_when_buffer_grows` | 连续讲话 6 秒后强制提交，单次解码长度有上限 |
+| `test_finish_redecodes_full_audio_to_fix_split_sentences` | 增量结果可能切断句子，停止时用完整音频重解码得到完整文本 |
+| `test_websocket_commits_sentence_then_streams_final` | 能量 VAD 引擎下，说完一句即提交，停止后返回完整 `final` |
+| `test_websocket_rejects_before_model_loaded` | 模型未就绪时返回中文 `error` 并关闭 |
+| `test_websocket_can_be_disabled` | `A2T_STREAM_MAX_SECONDS=0` 时拒绝实时连接 |
+| `test_js_connects_websocket_and_streams_pcm` | 前端建立 `/ws/stream`、发送 `start`/`stop` 与二进制 PCM |
+| `test_js_captures_microphone_with_audio_worklet` | AudioWorklet 采集、16kHz、ScriptProcessor 降级路径 |
+| `test_streaming_falls_back_to_upload_when_unavailable` | 实时通道失败后仍可录音并上传识别 |
+| `test_live_partial_does_not_overwrite_result_box` | 实时文本只写入实时区域，不改动底部结果框与复制/下载状态 |
 | `test_requirements_install_torch_cpu_together` | `requirements.txt` 含 CPU wheel 索引与 `torch` / `torchaudio`，一条命令即可安装 |
 | `test_lock_file_is_self_contained` | 锁文件自带 CPU 索引，torch 版本带 `+cpu` 后缀 |
 
@@ -101,9 +116,15 @@ python -m pytest -q
 python -m pytest -m slow -v -s
 ```
 
-实际结果：**1 passed, 57 deselected in 161.89s**（本次模型加载耗时受机器负载影响；此前同样用例约 24–76s。中文 `ratio=0.960, lang=zh`，英文 `ratio=1.000, lang=en`）
+实际结果：**3 passed, 82 deselected in 30.13s**（中文 `ratio=0.960, lang=zh`，英文 `ratio=1.000, lang=en`；两个流式用例同样通过）
 
-首次运行时模型尚未下载，同一用例耗时 **139.84s**，其中约 70 秒用于下载 SenseVoiceSmall（936MB）与 fsmn-vad（2MB）。
+| 用例 | 验证内容 | 结果 |
+|---|---|---|
+| `test_real_model_matches_reference` | 中英文样例的语种判断与字符相似度（阈值 0.6） | 通过（0.960 / 1.000） |
+| `test_real_model_streams_partial_then_final[chinese.wav]` | 分片喂入真实模型，停止前出现部分文本，停止后得到最终文本 | 通过 |
+| `test_real_model_streams_partial_then_final[english.wav]` | 同上，英文样例 | 通过 |
+
+首次运行时模型尚未下载，同一用例耗时 **139.84s**，其中约 70 秒用于下载 SenseVoiceSmall（936MB）与 fsmn-vad（2MB）。会话级 fixture 让三个用例共享一次模型加载。
 
 ## 4. 真实模型识别效果
 
@@ -306,6 +327,40 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 > 该用例完整模拟了「新电脑只装 Python 3.12，然后执行两条命令」的场景，依赖是从索引重新解析安装的，不是复用项目 `.venv`。模型使用项目内已有的 `models/` 缓存；如果交付包不含该目录，首次启动会额外从 ModelScope 下载约 900MB，需要网络。
 
+### 5.10 实时识别（WebSocket）验证
+
+服务启动后 `/health` 返回实时识别开关与上限：
+
+```json
+{"status":"ok","model_loaded":true,...,"streaming_enabled":true,"stream_max_seconds":60}
+```
+
+**命令行冒烟**：用 `scripts/check_stream.py` 把 `samples/chinese.wav` 按 1 倍速通过 `/ws/stream` 发送。
+
+| 指标 | 结果 |
+|---|---|
+| 首个中间结果 | 开始发送后 **1.30s** 出现 |
+| 中间结果次数 | 7 次，文本随说话逐步增长 |
+| 音频发送完毕 | 7.82s |
+| 服务端解码累计 | 5.09s（含停止时整段重解码） |
+| 端到端（含最终文本） | 8.75s |
+| 最终文本 | 今天天气不错，我们下午3点在会议室开会，请大家准时参加。 |
+
+**浏览器验证**：与 5.7 相同的合成音源方式，把 `samples/chinese.wav` 接入 `MediaStreamAudioDestinationNode` 作为麦克风；这次走的是真实的 AudioWorklet → WebSocket PCM → 真实模型链路。
+
+| 场景 | 操作 | 实际结果 |
+|---|---|---|
+| 实时出字 | 点击 Start Recording 后持续发送 7.8s 中文语音 | 约 **1.9s** 出现首个 `partial`；约 7.4s 时出现 `committed`（正常色），尾部未定稿文本为浅灰色 |
+| 底部结果框 | 实时识别过程中观察「识别结果」 | 保持为空，元信息隐藏，复制/下载保持禁用；实时文本只出现在「实时识别」区域 |
+| 停止收尾 | 点击 Stop Recording | 约 **0.8s** 后返回最终文本「天天气不错，我们下午3点在会议室开会，请大家准时参加。」；结果框写入最终文本，元信息显示「实时识别 · 音频时长：11.9s」，复制/下载恢复可用 |
+| 状态恢复 | 识别完成后 | 状态「识别完成，可以再次录音」，Start 恢复可用，Stop 禁用；录音 `00:11（116.9 KB）` 可回放 |
+| 实时通道失败回退 | 用测试脚本让 `new WebSocket` 抛错后开始录音 3 秒 | 实时区域提示「实时识别不可用，停止后会自动识别」，录音继续；停止后自动上传 `/api/transcribe`，0.8s 返回结果，实时区域更新为「已改用上传识别」 |
+| 网络与控制台 | 全程观察 | WebSocket 返回 `101 Switching Protocols` 后正常关闭；页面控制台无错误/警告 |
+
+> 合成音源在 `getUserMedia` 返回时就开始播放，而 AudioWorklet 初始化需要约 0.2s，导致开头「今」字被截掉（首次 `partial` 也从「天」开始）。这是自动化音源的启动时序问题，不是模型或流式逻辑缺陷；用真实麦克风时采集先于说话，不存在该截断。
+>
+> 最终文本由停止时的**整段重解码**产生，因此与实时过程中可能被切开的 `committed` 文本不完全一致，属于预期设计（见 `docs/design.md` 4.3）。
+
 ## 6. 性能数据
 
 | 场景 | 音频时长 | 推理耗时 | 实时倍率 |
@@ -314,9 +369,12 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 | 英文样例 | 7.61s | 0.66s | 11.5× |
 | 中英拼接 | 16.44s | 1.43s | 11.5× |
 | 网页录音（9 秒录音，含 7.8s 语音） | 7.83s | 0.70s | 11.2× |
+| 实时识别（7 次增量 + 停止整段重解码） | 7.83s | 解码累计 5.09s | 首个中间结果 1.30s |
 | 模型加载（已缓存，冷启动一次） | — | 约 10s | — |
 
 以上为 6 核 CPU、`A2T_THREADS=6` 下的单请求数据。长音频按 VAD 分段批处理，内存占用受 60 秒/16 段上限约束，不会随音频时长线性增长。
+
+实时识别的解码成本约为「增量解码次数 × 当前缓冲」加上停止时的一次整段解码；每段增量最多 6 秒，因此总成本随时长线性增长，不会出现重解全部历史音频的平方增长。60 秒连续讲话的停止收尾约需 4–5 秒。
 
 ## 7. 已知问题与限制
 
@@ -335,8 +393,9 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 | K11 | 首次请求需等模型加载 | 冷启动约 10 秒，期间 `/health` 返回 `warming` | 启动时已后台预热；前端轮询状态提示 |
 | K12 | 录音链路用合成音源 + 权限 mock 验证 | 未在物理麦克风和真实授权弹窗上复测 | 编码、上传、识别链路均为真实浏览器行为；需人工在真机点一次「允许」确认 |
 | K13 | 录音格式依赖浏览器 | Chrome/Edge 为 WebM/Opus，Firefox/Safari 的 MediaRecorder 未验证 | 前端已按能力探测 mimeType，服务端支持 `.webm/.ogg/.m4a`；目标浏览器为 Chrome/Edge |
-| K14 | 录音为「先录后传」 | 无法边说边出字 | 与 FR-12 一致；流式识别在范围之外 |
+| K14 | 实时识别不是模型原生流式 | 中间结果可能被后续解码改写，提交位置可能切在词中间 | 用分片 + VAD 增量提交实现近实时；停止时整段重解码，最终文本与上传识别一致 |
 | K15 | 录音只保存在页面内存 | 刷新或关闭会丢失未提交的录音 | `beforeunload` 已提示；正式使用请先停止并等待识别完成 |
+| K16 | 实时识别同样用合成音源 + 权限 mock 验证 | 未在物理麦克风和真实授权弹窗上复测 | AudioWorklet、WebSocket、模型链路均为真实执行，仅音源是文件；需人工在真机确认 |
 
 ## 8. 复现步骤
 
@@ -353,17 +412,20 @@ python -m pytest -m slow -v -s
 # 启动服务后手工验证
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 curl.exe -F "file=@samples/chinese.wav" "http://127.0.0.1:8000/api/transcribe"
+python scripts\check_stream.py
 
 # 浏览器打开 http://127.0.0.1:8000
 # 1) 拖入 samples/chinese.wav → 点击播放确认音频，再开始识别
-# 2) 允许麦克风 → 开始录音 → 说话 → 停止录音 → 回放并查看识别结果
+# 2) 允许麦克风 → 开始录音 → 说话 → 观察实时文本 → 停止录音 → 回放并查看最终结果
 ```
 
 ## 9. 结论
 
-- 默认测试套件 57 项全部通过，覆盖参数校验、错误码、文本后处理、音频转码、VAD 分段映射、模型路径解析、安装启动契约与录音/回放前端契约。
-- 真实模型在中英文样例上分别达到 0.960 / 1.000 的字符相似度，语种判断正确。
+- 默认测试套件 82 项全部通过，覆盖参数校验、错误码、文本后处理、音频转码、VAD 分段映射、模型路径解析、安装启动契约、WebSocket 流式会话与录音/回放/实时前端契约。
+- 真实模型在中英文样例上分别达到 0.960 / 1.000 的字符相似度，语种判断正确；真实分片链路在停止前即可产出部分文本。
 - 端到端 HTTP 链路可用，JSON / txt / SRT 三种输出均验证通过，SRT 时间轴来自真实 VAD 区间。
+- 实时识别通过命令行与浏览器两条路径验证：首个中间结果约 1.3–1.9s 出现，停止后 0.8s 内返回最终文本；实时文本只渲染在独立的实时区域，底部结果框留给最终结果。
+- 停止时对整段音频重解码，修正增量提交可能切开的句子，最终文本与 `/api/transcribe` 一致。
 - 浏览器界面的拖拽上传、识别、元信息、下载均验证通过，控制台无报错。
 - 实时录音完成权限拒绝、正常录音、60 秒自动停止、无语音提示、连续录音五项验证；录音经真实 MediaRecorder 编码后可直接被后端识别。
 - 上传文件与录音都能在页面内播放/暂停、拖动进度、显示时间；无时长元数据的 WebM 录音用计时时长补全，无法解码的格式会提示但不影响识别。

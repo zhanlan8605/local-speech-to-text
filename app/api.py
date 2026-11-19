@@ -38,6 +38,8 @@ async def health(request: Request) -> HealthResponse:
         backend=settings.backend,
         threads=settings.threads,
         max_upload_mb=settings.max_upload_mb,
+        streaming_enabled=settings.streaming_enabled,
+        stream_max_seconds=max(0, settings.stream_max_seconds),
         version=settings.version,
     )
 

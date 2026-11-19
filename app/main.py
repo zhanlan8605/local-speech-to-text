@@ -18,6 +18,7 @@ from .api import router
 from .asr.base import ASREngine
 from .asr.sensevoice import SenseVoiceEngine
 from .config import STATIC_DIR, settings
+from .streaming import router as stream_router
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ def create_app(
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(router)
+    app.include_router(stream_router)
 
     @app.middleware("http")
     async def reject_oversized_upload(request: Request, call_next):

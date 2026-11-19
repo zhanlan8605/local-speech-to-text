@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import SAMPLES_DIR, settings
+from app.config import SAMPLES_DIR
 
 pytestmark = pytest.mark.slow
 
@@ -46,23 +46,9 @@ def _load_reference() -> dict[str, tuple[str, str]]:
 
 
 @pytest.fixture(scope="module")
-def engine():
-    from app.asr.sensevoice import SenseVoiceEngine
-
-    eng = SenseVoiceEngine(
-        model_id=settings.asr_model,
-        vad_model_id=settings.vad_model or None,
-        device=settings.device,
-        threads=settings.threads,
-        punc_model_id=settings.punc_model or None,
-    )
-    eng.warmup()
-    if not eng.loaded:
-        pytest.skip(f"模型未能加载：{eng.load_error}")
-    try:
-        yield eng
-    finally:
-        eng.unload()
+def engine(real_engine):
+    """沿用 conftest 中会话级的真实引擎，避免每个测试文件重复加载模型。"""
+    return real_engine
 
 
 def test_real_model_matches_reference(engine):

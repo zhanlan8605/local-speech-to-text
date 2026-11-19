@@ -12,6 +12,8 @@ class HealthResponse(BaseModel):
     backend: str
     threads: int
     max_upload_mb: int
+    streaming_enabled: bool = True
+    stream_max_seconds: int = 60
     version: str
 
 

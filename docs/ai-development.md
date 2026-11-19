@@ -16,7 +16,7 @@
 | P1 | 音频转码、SenseVoice 引擎、`/api/transcribe`、Web 页面 | 可用的文件转写 MVP |
 | P2 | 标点模型开关、SRT 输出 | 字幕导出 |
 | P3 | 测试补齐、文档 | 四份文档 + 测试报告 |
-| P4（规划） | WebSocket 实时流式 | 见 design.md「已知限制」 |
+| P4 | WebSocket 实时识别、增量文本、失败回退 | 边说边出字 + 最终文本 |
 
 拆分依据：**先打通最长的链路**（上传 → 转码 → 推理 → 返回），再补附属能力。这样最早的失败点（模型能否装、能否跑）会在 P0/P1 暴露，而不是等到最后。
 
@@ -102,7 +102,7 @@
 **设计取舍**：
 
 - 不新增后端接口。`MediaRecorder` 产出 WebM/Opus，前端把它包成 `File` 后仍调用 `POST /api/transcribe`；服务端已有 `.webm` 白名单与 ffmpeg 转码，链路零改动。
-- 不做流式。需求明确「停止录音后才能发起完整识别」，因此采用「先录后传」，避免引入 WebSocket 与流式模型。
+- 当时的需求是「停止录音后识别」，因此先采用「先录后传」，不引入 WebSocket 与流式模型；后续新增的「边说边出字」在 4.13 补充，MediaRecorder 仍保留用于回放与实时失败时的兜底。
 - 用状态机管住按钮：`idle → requesting → recording → stopping → idle`。录音中禁用上传与「开始识别」，防止并发。
 - 60 秒上限用 `setTimeout`，并在 `dataavailable` 回调里按实际耗时兜底；后台标签页定时器可能被节流，两个机制一起保证不会无限录制。
 - 录音格式按能力探测：`audio/webm;codecs=opus` → `audio/webm` → `audio/ogg;codecs=opus` → `audio/mp4`，文件名扩展名随之变化。
@@ -164,6 +164,30 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 - `app/main.py` 的模块文档改为 `python -m uvicorn ...`。
 
 **验证**：在全新临时 venv 中实际执行 `python -m pip install -r requirements.txt`（非 dry-run），`pip exit 0`，安装出 torch `2.15.0+cpu`、torchaudio `2.11.1+cpu` 等依赖；再用该环境执行 `python -m uvicorn app.main:app --port 8020`，`/health` 返回 `model_loaded=true`，首页 200，上传样例识别正常。详细数据见 `docs/test-report.md` 5.9。
+
+### 4.13 实时识别：不改模型，用滚动重解码模拟流式
+
+**需求变化**：点击 Start Recording 后，持续说话时页面就要不断出现识别文本，停止后再给最终文本；允许 WebSocket / HTTP 分片，不要求模型原生流式，也不设毫秒级指标。
+
+**判断**：SenseVoiceSmall 不是流式模型，强行改模型（chunk-based attention / cache）风险高、效果难保证。更稳妥的做法是把「实时」定义在**交互层**：浏览器按 128ms 分片上传 PCM，服务端对未提交缓冲滚动解码，用 VAD 判断句尾后增量提交。
+
+**实现要点**：
+
+- 传输用**原始 PCM16LE / 16kHz / 单声道**，不用 WebM 容器：服务端可以随时切片重解码，不必为每一小片重新解容器。
+- 前端优先 AudioWorklet（音频线程，不受主线程卡顿影响），`AudioContext({sampleRate:16000})` 让浏览器重采样；无 Worklet 时降级到 `ScriptProcessor`。
+- 解码按**音频时长**节流（新增 ≥1s、pending ≥0.8s），而不是墙钟，测试可复现且 CPU 占用可控。
+- `StreamingSession` 维护 pending 缓冲与 committed 文本；段尾距缓冲末尾 ≥0.45s 视为说完，提交并裁剪音频；pending ≥6s 强制提交，避免长讲话越来越慢。
+- WebSocket 消息：`ready` / `started` / `partial` / `final` / `error`；模型未加载、功能关闭、帧过大都会返回中文错误并安全关闭。
+- 实时通道失败不阻塞录音：MediaRecorder 仍并行产出 WebM，停止时若实时结果不可用，自动回退 `/api/transcribe`。
+
+**开发中发现并修复的两个问题**：
+
+1. **录音收尾时 `recordPhase` 已切到 `stopping`**，而 `acceptFile()` 用 `isLocked()` 拦截非 idle 状态，导致实时成功但页面仍提示「录音数据不可用」。修复：`acceptFile` 增加 `{ fromRecording: true }`，只对录音自身产出的文件放行。
+2. **增量提交可能从词中间切开**：浏览器实测出现「请大家准。时参加。」。修复：会话保留完整 PCM（≤60s，约 2MB），停止时整段重解码一次，最终文本与上传识别一致；增量结果只负责「边说边出」。
+
+**交互调整**：实时文本只显示在独立的「实时识别」区域，不写入底部「识别结果」框；停止后最终文本才进入结果框并启用复制/下载，避免实时中间结果被误当成最终稿。
+
+**验证**：`scripts/check_stream.py` 首个中间结果 1.30s、7 次 partial、最终文本正确；浏览器合成音源链路首个 partial 约 1.9s，停止后 0.8s 返回最终文本，控制台无错误。默认套件新增 16 项流式会话/协议测试与 9 项前端实时契约；慢速套件新增 2 项真实模型流式用例。详细数据见 `docs/test-report.md` 3.1、3.2、5.10。
 
 ## 5. AI 产出的校验方式
 

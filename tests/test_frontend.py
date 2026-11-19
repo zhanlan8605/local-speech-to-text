@@ -51,6 +51,12 @@ def test_js_allows_recording_again_after_result():
     assert "setRecordState(\"done\"" in APP_JS
 
 
+def test_js_recording_file_is_accepted_while_stopping():
+    # 录音收尾时 recordPhase 已切到 stopping，不能因此把自己的录音判为「不可用」
+    assert "!options.fromRecording && isLocked()" in APP_JS
+    assert "{ fromRecording: true }" in APP_JS
+
+
 def test_index_exposes_player_controls():
     assert 'id="play-toggle"' in INDEX
     assert 'id="play-seek"' in INDEX
@@ -82,3 +88,71 @@ def test_upload_limit_is_10mb_and_synced_from_health():
     assert "data.max_upload_mb" in APP_JS
     assert "上限 ${maxUploadMb}MB" in APP_JS
     assert "单个文件最大 10MB" in INDEX
+
+
+# ---------------------------------------------------------------- 实时识别
+WORKLET = STATIC / "pcm-worklet.js"
+WORKLET_JS = WORKLET.read_text(encoding="utf-8")
+
+
+def test_index_exposes_live_transcript_area():
+    assert 'id="live"' in INDEX
+    assert 'id="live-text"' in INDEX
+    assert 'id="live-committed"' in INDEX
+    assert 'id="live-partial"' in INDEX
+    assert "实时识别" in INDEX
+    assert "边说边出字" in INDEX
+
+
+def test_js_connects_websocket_and_streams_pcm():
+    assert 'const STREAM_PATH = "/ws/stream"' in APP_JS
+    assert "new WebSocket(streamUrl())" in APP_JS
+    assert "ws.binaryType = \"arraybuffer\"" in APP_JS
+    assert 'JSON.stringify({ type: "start", language: els.language.value })' in APP_JS
+    assert 'JSON.stringify({ type: "stop" })' in APP_JS
+
+
+def test_js_renders_partial_results_from_websocket():
+    assert 'data.type === "partial"' in APP_JS
+    assert 'data.type === "final"' in APP_JS
+    assert "els.liveCommitted.textContent" in APP_JS
+    assert "els.livePartial.textContent" in APP_JS
+    assert "showLiveText(" in APP_JS
+
+
+def test_live_partial_does_not_overwrite_result_box():
+    # 实时文本只出现在实时区域，底部结果框留给停止后的最终文本
+    start = APP_JS.index("function showLiveText")
+    end = APP_JS.index("function closeStreamSocket")
+    body = APP_JS[start:end]
+    assert "els.result.value" not in body
+    assert "setResultActions" not in body
+
+
+def test_js_captures_microphone_with_audio_worklet():
+    assert "ctx.audioWorklet.addModule(\"/static/pcm-worklet.js\")" in APP_JS
+    assert 'new window.AudioWorkletNode(ctx, "pcm-capture"' in APP_JS
+    assert "STREAM_SAMPLE_RATE = 16000" in APP_JS
+    assert "createScriptProcessorCapture" in APP_JS  # 无 AudioWorklet 时的降级路径
+
+
+def test_worklet_emits_16k_int16_frames():
+    assert 'registerProcessor("pcm-capture"' in WORKLET_JS
+    assert "Int16Array" in WORKLET_JS
+    assert "targetRate" in WORKLET_JS
+    assert "port.postMessage" in WORKLET_JS
+
+
+def test_streaming_falls_back_to_upload_when_unavailable():
+    # 实时通道失败时仍能录音并上传识别，不能把录音功能一起弄坏
+    assert "startStreamCapture()" in APP_JS
+    assert "showStreamUnavailable(err)" in APP_JS
+    assert "pendingFinal" in APP_JS
+    assert "transcribeFile(file, `recording-${stamp}`)" in APP_JS
+    assert "实时识别不可用，停止后会自动识别" in APP_JS
+    assert "实时识别不可用，已改用上传识别" in APP_JS
+
+
+def test_js_reads_streaming_flags_from_health():
+    assert "streamingEnabled = data.streaming_enabled !== false" in APP_JS
+    assert "服务端已关闭实时识别" in APP_JS

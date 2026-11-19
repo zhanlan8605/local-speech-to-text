@@ -23,7 +23,7 @@
       <section class="card">
         <div class="card-head">
           <h2>实时录音</h2>
-          <span class="card-note">单次最长 60 秒</span>
+          <span class="card-note">边说边出字 · 单次最长 60 秒</span>
         </div>
 
         <div id="recorder" class="recorder" data-state="idle">
@@ -44,8 +44,21 @@
             </button>
           </div>
 
+          <div id="live" class="live hidden">
+            <div class="live__head">
+              <span class="live__title">实时识别</span>
+              <span id="live-state" class="live__state" role="status" aria-live="polite">
+                正在连接…
+              </span>
+            </div>
+            <p id="live-text" class="live__text" aria-live="polite">
+              <span id="live-committed"></span><span id="live-partial" class="live__partial"></span>
+            </p>
+          </div>
+
           <p class="recorder__hint">
-            点击开始后浏览器会请求麦克风权限；停止录音后自动提交识别，完成后可再次录音。
+            点击开始后浏览器会请求麦克风权限；说话过程中实时显示识别文本，停止录音后给出最终结果。
+            如果浏览器不支持实时识别，停止后会自动上传音频再识别。
           </p>
         </div>
       </section>

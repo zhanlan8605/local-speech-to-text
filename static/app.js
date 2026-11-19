@@ -11,6 +11,11 @@
     recordTimer: $("record-timer"),
     recordStart: $("record-start"),
     recordStop: $("record-stop"),
+    live: $("live"),
+    liveState: $("live-state"),
+    liveText: $("live-text"),
+    liveCommitted: $("live-committed"),
+    livePartial: $("live-partial"),
     dropzone: $("dropzone"),
     uploadLimit: $("upload-limit"),
     fileInput: $("file-input"),
@@ -83,6 +88,15 @@
   let recordLimitId = null;
   let recordFailed = false;
   let autoStopped = false;
+
+  // 实时识别（WebSocket + PCM 分片）
+  const STREAM_PATH = "/ws/stream";
+  const STREAM_SAMPLE_RATE = 16000;
+  const STREAM_FRAME_SIZE = 2048; // 16kHz 下约 128ms 一帧
+  const STREAM_FINAL_TIMEOUT_MS = 30000;
+  let streamingEnabled = true; // 以 /health 返回值为准
+  let stream = null; // 当前流式会话
+  let pendingFinal = null; // 停止录音时等待最终文本的 Promise
 
   // ---------------------------------------------------------------- 工具
   function formatBytes(bytes) {
@@ -340,6 +354,7 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       applyUploadLimit(data.max_upload_mb);
+      streamingEnabled = data.streaming_enabled !== false;
       if (data.model_loaded) {
         setStatus("ready", "模型已就绪");
         return true;
@@ -378,9 +393,10 @@
   }
 
   // ---------------------------------------------------------------- 文件选择
-  function acceptFile(file, displayName, knownDurationMs = 0) {
+  function acceptFile(file, displayName, knownDurationMs = 0, options = {}) {
     if (!file) return false;
-    if (isLocked()) {
+    // 录音收尾时 recordPhase 仍是 stopping，这里需要放行自己产出的文件
+    if (!options.fromRecording && isLocked()) {
       showError("请等待当前任务结束后再选择文件。");
       return false;
     }
@@ -456,6 +472,324 @@
     acceptFile(file);
   });
 
+  // ---------------------------------------------------------------- 实时识别
+  function streamUrl() {
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    return `${scheme}://${location.host}${STREAM_PATH}`;
+  }
+
+  function renderLive(committed, partial, stateText) {
+    els.liveCommitted.textContent = committed || "";
+    els.livePartial.textContent = partial || "";
+    els.liveText.classList.toggle("live__text--empty", !(committed || partial));
+    if (stateText != null) els.liveState.textContent = stateText;
+  }
+
+  // 实时结果只渲染在实时区域：底部结果框保留给停止后的最终文本
+  function showLiveText(committed, partial, stateText) {
+    renderLive(committed, partial, stateText);
+  }
+
+  function closeStreamSocket(session) {
+    const ws = session.ws;
+    session.ws = null;
+    if (!ws) return;
+    try {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+    } catch {
+      /* 已经关闭时忽略 */
+    }
+  }
+
+  function failStream(session, err) {
+    if (session.failed || session.done) return;
+    session.failed = true;
+    if (session.onReadyFail) session.onReadyFail(err);
+    closeStreamSocket(session);
+    renderLive("", "", "实时识别不可用，停止后会自动识别");
+    if (session.resolveResult) session.resolveResult(null);
+  }
+
+  function handleStreamMessage(session, event) {
+    let data;
+    try {
+      data = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (!data || !data.type) return;
+
+    if (data.type === "ready") {
+      if (Number(data.max_seconds) > 0) session.maxSeconds = Number(data.max_seconds);
+      return;
+    }
+    if (data.type === "started") {
+      if (session.onReady) session.onReady();
+      return;
+    }
+    if (data.type === "partial") {
+      session.committed = data.committed || "";
+      session.partial = data.partial || "";
+      showLiveText(session.committed, session.partial, "实时识别中…");
+      return;
+    }
+    if (data.type === "final") {
+      session.done = true;
+      closeStreamSocket(session);
+      if (session.resolveResult) session.resolveResult(data.text || "");
+      return;
+    }
+    if (data.type === "error") {
+      failStream(session, new Error(data.detail || "实时识别出错"));
+    }
+  }
+
+  // 把麦克风音频降采样成 16kHz/16bit/单声道 PCM，经 WebSocket 分片发送
+  function createScriptProcessorCapture(ctx, send) {
+    const node = ctx.createScriptProcessor(4096, 1, 1);
+    const ratio = ctx.sampleRate / STREAM_SAMPLE_RATE;
+    let frame = new Int16Array(STREAM_FRAME_SIZE);
+    let filled = 0;
+
+    const emit = (sample) => {
+      const value = sample > 1 ? 1 : sample < -1 ? -1 : sample;
+      frame[filled] = Math.round(value < 0 ? value * 32768 : value * 32767);
+      filled += 1;
+      if (filled >= frame.length) {
+        send(frame.buffer);
+        frame = new Int16Array(STREAM_FRAME_SIZE);
+        filled = 0;
+      }
+    };
+
+    node.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      event.outputBuffer.getChannelData(0).fill(0); // 不要把麦克风原声播出来
+      if (ratio <= 1.0001) {
+        for (let i = 0; i < input.length; i += 1) emit(input[i]);
+        return;
+      }
+      for (let index = 0; index < input.length - 1; index += ratio) {
+        const i0 = Math.floor(index);
+        const i1 = Math.min(i0 + 1, input.length - 1);
+        const frac = index - i0;
+        emit(input[i0] * (1 - frac) + input[i1] * frac);
+      }
+    };
+    return node;
+  }
+
+  async function openMicrophoneCapture(session) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) throw new Error("浏览器不支持音频采集");
+    if (!mediaStream) throw new Error("麦克风尚未启动");
+
+    let ctx;
+    try {
+      // Chrome/Edge 会按目标采样率重采样麦克风输入，避免前端做粗糙的下采样
+      ctx = new Ctx({ sampleRate: STREAM_SAMPLE_RATE });
+    } catch {
+      ctx = new Ctx();
+    }
+    if (ctx.state === "suspended") {
+      try {
+        await ctx.resume();
+      } catch {
+        /* 某些浏览器在无用户手势时拒绝 resume，忽略后继续 */
+      }
+    }
+
+    const source = ctx.createMediaStreamSource(mediaStream);
+    let filter = null;
+    if (ctx.sampleRate > 20000) {
+      // 高采样率降到 16k 前先做低通，减少混叠
+      filter = ctx.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.frequency.value = 7000;
+      filter.Q.value = 0.7;
+    }
+
+    const send = (buffer) => {
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(buffer);
+      }
+    };
+
+    let node;
+    if (ctx.audioWorklet && typeof window.AudioWorkletNode === "function") {
+      await ctx.audioWorklet.addModule("/static/pcm-worklet.js");
+      node = new window.AudioWorkletNode(ctx, "pcm-capture", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        processorOptions: {
+          inputRate: ctx.sampleRate,
+          targetRate: STREAM_SAMPLE_RATE,
+          frameSize: STREAM_FRAME_SIZE,
+        },
+      });
+      node.port.onmessage = (event) => send(event.data);
+    } else {
+      node = createScriptProcessorCapture(ctx, send);
+    }
+
+    if (filter) {
+      source.connect(filter);
+      filter.connect(node);
+    } else {
+      source.connect(node);
+    }
+    // 接到 destination 才能保证音频图被渲染；处理器不写输出，因此不会外放
+    node.connect(ctx.destination);
+
+    session.ctx = ctx;
+    session.source = source;
+    session.filter = filter;
+    session.node = node;
+  }
+
+  async function startStreamCapture() {
+    if (!streamingEnabled) throw new Error("服务端已关闭实时识别");
+    if (typeof window.WebSocket === "undefined") throw new Error("浏览器不支持 WebSocket");
+
+    const ws = new WebSocket(streamUrl());
+    ws.binaryType = "arraybuffer";
+
+    const session = {
+      ws,
+      ctx: null,
+      source: null,
+      node: null,
+      filter: null,
+      done: false,
+      failed: false,
+      committed: "",
+      partial: "",
+      onReady: null,
+      onReadyFail: null,
+      resolveResult: null,
+    };
+    session.resultPromise = new Promise((resolve) => {
+      session.resolveResult = resolve;
+    });
+
+    stream = session;
+    els.live.classList.remove("hidden");
+    renderLive("", "", "正在连接…");
+
+    const ready = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("实时识别连接超时")), 8000);
+      session.onReady = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      session.onReadyFail = (err) => {
+        clearTimeout(timer);
+        reject(err);
+      };
+    });
+
+    ws.addEventListener("open", () => {
+      try {
+        ws.send(JSON.stringify({ type: "start", language: els.language.value }));
+      } catch {
+        /* 连接刚断时忽略 */
+      }
+    });
+    ws.addEventListener("message", (event) => handleStreamMessage(session, event));
+    ws.addEventListener("error", () => failStream(session, new Error("实时识别连接失败")));
+    ws.addEventListener("close", () => {
+      if (!session.done) failStream(session, new Error("实时识别连接已断开"));
+    });
+
+    try {
+      await ready;
+      await openMicrophoneCapture(session);
+      renderLive("", "", "请开始说话…");
+    } catch (err) {
+      failStream(session, err);
+      if (stream === session) stream = null;
+      throw err;
+    }
+  }
+
+  function stopStreamCapture() {
+    const session = stream;
+    stream = null;
+    if (!session) return Promise.resolve(null);
+
+    if (session.node && session.node.port) {
+      try {
+        session.node.port.onmessage = null;
+      } catch {
+        /* 忽略 */
+      }
+    }
+    [session.node, session.filter, session.source].forEach((node) => {
+      try {
+        if (node) node.disconnect();
+      } catch {
+        /* 忽略 */
+      }
+    });
+    if (session.ctx) {
+      try {
+        const closing = session.ctx.close();
+        if (closing && typeof closing.catch === "function") closing.catch(() => {});
+      } catch {
+        /* 忽略 */
+      }
+      session.ctx = null;
+    }
+    if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+      try {
+        session.ws.send(JSON.stringify({ type: "stop" }));
+      } catch {
+        /* 忽略 */
+      }
+    }
+
+    return withTimeout(session.resultPromise, STREAM_FINAL_TIMEOUT_MS).then((text) => {
+      closeStreamSocket(session);
+      return typeof text === "string" ? text : null;
+    });
+  }
+
+  function withTimeout(promise, ms) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(null), ms);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(null);
+        }
+      );
+    });
+  }
+
+  function showStreamUnavailable(err) {
+    els.live.classList.remove("hidden");
+    renderLive("", "", "实时识别不可用，停止后会自动识别");
+    if (window.console && console.warn) console.warn("实时识别启动失败：", err);
+  }
+
+  function applyStreamResult(text, elapsedMs) {
+    clearError();
+    els.result.value = text;
+    lastResult = { text, format: "txt" };
+    setResultActions(Boolean(text.trim()));
+    els.meta.textContent =
+      `实时识别 · 音频时长：${(elapsedMs / 1000).toFixed(1)}s · 模型：SenseVoiceSmall`;
+    els.meta.classList.remove("hidden");
+    renderLive(text, "", "识别完成");
+  }
+
   // ---------------------------------------------------------------- 录音
   function describeMediaError(err) {
     const name = (err && err.name) || "";
@@ -525,6 +859,11 @@
     autoStopped = false;
     renderRecordTimer();
     setRecordState("requesting", "正在请求麦克风权限…");
+    els.live.classList.add("hidden");
+    renderLive("", "", "正在连接…");
+    els.result.value = "";
+    els.meta.classList.add("hidden");
+    setResultActions(false);
     syncControls();
 
     try {
@@ -540,6 +879,14 @@
     }
 
     const mimeType = pickRecorderMime();
+    setRecordState("requesting", "正在启动实时识别…");
+    try {
+      await startStreamCapture();
+    } catch (err) {
+      // 实时识别失败不阻塞录音：MediaRecorder 仍在采集，停止后走上传识别
+      showStreamUnavailable(err);
+    }
+
     try {
       recorder = mimeType
         ? new MediaRecorder(mediaStream, { mimeType })
@@ -623,6 +970,9 @@
     );
     syncControls();
 
+    // 先结束麦克风采集并等待服务端返回最终文本，同时让 MediaRecorder 收尾
+    pendingFinal = stopStreamCapture();
+
     try {
       recorder.stop();
     } catch (err) {
@@ -644,7 +994,7 @@
       Math.max(0, performance.now() - recordStartedAt);
     recordElapsedMs = elapsed;
     recorder = null;
-    recordPhase = "idle";
+    recordPhase = "stopping"; // 保持锁定，避免最终文本落地前又开始新录音
     els.recorder.classList.remove("recorder--active");
     renderRecordTimer();
     syncControls();
@@ -655,6 +1005,8 @@
       recordElapsedMs = 0;
       renderRecordTimer();
       setRecordState("error", "录音失败，请重试");
+      recordPhase = "idle";
+      syncControls();
       return;
     }
 
@@ -667,6 +1019,8 @@
       renderRecordTimer();
       setRecordState("error", "录音过短");
       showError("录音时间太短或没有录到声音，请至少说一句话后再停止。");
+      recordPhase = "idle";
+      syncControls();
       return;
     }
 
@@ -676,23 +1030,49 @@
       type: blobType || "audio/webm",
     });
 
-    if (!acceptFile(file, `录音 ${formatDuration(elapsed)}（${formatBytes(blob.size)}）`, elapsed)) {
+    if (!acceptFile(file, `录音 ${formatDuration(elapsed)}（${formatBytes(blob.size)}）`, elapsed, { fromRecording: true })) {
       setRecordState("error", "录音数据不可用");
+      recordPhase = "idle";
+      syncControls();
       return;
     }
 
     setRecordState(
       "recognizing",
-      wasAutoStopped ? "已达到 60 秒上限，正在识别…" : "录音已停止，正在识别…"
+      wasAutoStopped ? "已达到 60 秒上限，正在生成最终文本…" : "录音已停止，正在生成最终文本…"
     );
+
+    lastSourceName = `recording-${stamp}`;
+    const streamedText = pendingFinal ? await pendingFinal : null;
+    pendingFinal = null;
+
+    // 实时识别成功：直接使用服务端返回的最终文本，不再重复上传
+    if (typeof streamedText === "string") {
+      if (streamedText.trim()) {
+        applyStreamResult(streamedText, elapsed);
+        setRecordState("done", "识别完成，可以再次录音");
+      } else {
+        setRecordState("error", "未识别到语音内容，可以重试");
+      }
+      recordPhase = "idle";
+      syncControls();
+      return;
+    }
+
+    // 兜底：实时通道不可用（浏览器不支持 AudioWorklet、连接失败等）时上传识别
     const result = await transcribeFile(file, `recording-${stamp}`);
     if (result === "ok") {
       setRecordState("done", "识别完成，可以再次录音");
+      if (!els.live.classList.contains("hidden")) {
+        renderLive("", "", "实时识别不可用，已改用上传识别");
+      }
     } else if (result === "empty") {
       setRecordState("error", "未识别到语音内容，可以重试");
     } else {
       setRecordState("error", "识别失败，请重试");
     }
+    recordPhase = "idle";
+    syncControls();
   }
 
   els.recordStart.addEventListener("click", () => { void startRecording(); });
@@ -818,6 +1198,9 @@
   window.addEventListener("pagehide", () => {
     clearRecorderTimers();
     stopStream();
+    if (stream) {
+      void stopStreamCapture();
+    }
   });
 
   watchHealth();

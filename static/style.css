@@ -203,6 +203,53 @@ h2 {
   font-size: 12px;
 }
 
+/* 实时识别文本：已提交部分正常显示，未说完的尾部用浅色 */
+.live {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.live__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.live__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .02em;
+}
+
+.live__state {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.live__text {
+  margin: 0;
+  min-height: 1.7em;
+  font-size: 15px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.live__text--empty::before {
+  content: "等待语音…";
+  color: #9ca3af;
+}
+
+.live__partial {
+  color: #6b7280;
+}
+
 .dropzone {
   border: 2px dashed #cbd5e1;
   border-radius: 12px;
